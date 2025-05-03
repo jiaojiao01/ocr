@@ -1,13 +1,11 @@
 import os
 import fitz  # PyMuPDF
 import requests
-import json
 import pandas as pd
 from pathlib import Path
 import cv2
 import numpy as np
 from PIL import Image
-import io
 from paddleocr import PaddleOCR
 import re
 
@@ -27,7 +25,7 @@ class TableExtractor:
         try:
             doc = fitz.open(pdf_path)
             text = ""
-            
+            print("jiaojiao",doc,type(doc))
             # 获取PDF页数
             total_pages = len(doc)
             # print(f"PDF总页数: {total_pages}")
@@ -47,8 +45,9 @@ class TableExtractor:
                 thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
                 
                 # 使用PaddleOCR进行识别
-                result = self.ocr.ocr(thresh, cls=True)
                 
+                result = self.ocr.ocr(thresh, cls=True)
+                print(f"result{result}")
                 # 添加页面标记和内容
                 text += f"\n{'='*50}\n"
                 text += f"第 {page_num} 页内容:\n"

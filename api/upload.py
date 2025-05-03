@@ -3,16 +3,14 @@ from fastapi.middleware.cors import CORSMiddleware
 import os
 import uuid
 import asyncio
-from typing import Dict, Callable
-import shutil
+from typing import Dict
 from pathlib import Path
 import logging
 import time
 from datetime import datetime, timedelta
 import aiofiles
-import math
 from starlette.middleware.base import BaseHTTPMiddleware
-
+from ocr.work import TableExtractor 
 app = FastAPI()
 logging.basicConfig(
     level=logging.INFO,
@@ -63,38 +61,18 @@ app.add_middleware(
 upload_tasks: Dict[str, Dict] = {}
 
 # 上传文件保存路径
-UPLOAD_DIR = Path("uploads")
-UPLOAD_DIR.mkdir(exist_ok=True)
-
+UPLOAD_DIR = Path(__file__).parent.parent / "uploads"
+# UPLOAD_DIR.mkdir(exist_ok=True,parents=True)
+try:
+    UPLOAD_DIR.mkdir(exist_ok=True, parents=True)
+    logger.info(f"上传目录已创建或已存在: {UPLOAD_DIR.absolute()}")
+except Exception as e:
+    logger.error(f"无法创建上传目录: {str(e)}")
 # 分块大小（8MB）
-CHUNK_SIZE = 8 * 1024 * 1024
+CHUNK_SIZE = 8*1024*1024
 
-async def write_file_in_chunks(file: UploadFile, file_path: Path, task_id: str):
-    """分块写入文件并更新进度"""
-    total_size = 0
-    try:
-        async with aiofiles.open(file_path, "wb") as buffer:
-            while True:
-                # 将同步读取操作放入线程池
-                chunk = await asyncio.to_thread(file.file.read, CHUNK_SIZE)
-                if not chunk:
-                    break
-                await buffer.write(chunk)
-                # 更新进度
-                upload_tasks[task_id]["progress"] = min(100, int((file.file.tell() / file.size) * 100))
-                # upload_tasks[task_id]["progress"] = progress
-                logger.info(f"文件上传进度 - 任务ID: {task_id}, 进度: {progress}%")
-                # 让出控制权,避免阻塞
-                await asyncio.sleep(0)
-    except Exception as e:
-        logger.error(f"文件写入错误 - 任务ID: {task_id}, 错误: {str(e)}")
-        upload_tasks[task_id].update({
-            "status": "failed",
-            "last_error": str(e)
-        })
-        raise
 
-async def process_file_upload(file: UploadFile, task_id: str, file_path: Path):
+async def process_file_upload(file_content: bytes, task_id: str, file_path: Path):
     """后台处理文件上传"""
     try:
         upload_tasks[task_id].update({
@@ -102,8 +80,29 @@ async def process_file_upload(file: UploadFile, task_id: str, file_path: Path):
             "progress": 0
         })
         
-        # 在新的事件循环中异步处理文件写入
-        await write_file_in_chunks(file, file_path, task_id)
+        # 获取文件大小
+        file_size = len(file_content)
+        
+        # 分块写入文件
+        async with aiofiles.open(file_path, "wb") as buffer:
+            uploaded_size = 0
+            chunk_size = CHUNK_SIZE  # 使用定义的块大小
+            
+            for i in range(0, file_size, chunk_size):
+                chunk = file_content[i:i+chunk_size]
+                await buffer.write(chunk)
+                
+                # 更新上传进度
+                uploaded_size += len(chunk)
+                progress = min(100, int((uploaded_size / file_size) * 100))
+                # logger.info(progress)
+                upload_tasks[task_id].update({
+                    "progress": progress,
+                    "uploaded_size": uploaded_size
+                })
+                
+                # 让出控制权,避免阻塞
+                await asyncio.sleep(0)
         
         # 文件写入完成后，更新状态为completed
         upload_tasks[task_id].update({
@@ -121,9 +120,104 @@ async def process_file_upload(file: UploadFile, task_id: str, file_path: Path):
                 logger.info(f"已删除不完整文件: {file_path}")
         except Exception as cleanup_error:
             logger.error(f"清理文件失败: {str(cleanup_error)}")
-    finally:
-        if 'loop' in locals():
-            loop.close()
+
+
+@app.post("/api/upload/pdf")
+async def upload_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...), task_id: str = Form(...)):
+    logger.info(f"收到上传请求，task_id: {task_id}, 文件大小: {file.size} bytes")
+    
+    if not file.filename.endswith('.pdf'):
+        raise HTTPException(status_code=400, detail="只支持PDF文件")
+    if not task_id or task_id not in upload_tasks:
+        raise HTTPException(status_code=400, detail="无效的任务ID")
+    
+    try:
+        # 先读取整个文件内容到内存
+        file_content = await file.read()
+        file_size = len(file_content)
+        logger.info(f"成功读取文件内容，大小: {file_size} bytes")
+        
+        file_path = UPLOAD_DIR / f"{task_id}.pdf"
+        upload_tasks[task_id].update({
+            "file_path": str(file_path),
+            "status": "uploading",
+            "total_size": file_size,
+            "uploaded_size": 0
+        })
+        
+        # 将文件内容传递给后台任务
+        await process_file_upload(file_content, task_id, file_path)
+
+        # return {"success": True, "message": "文件上传已开始处理"}
+    except Exception as e:
+        logger.error(f"准备上传文件失败: {str(e)}")
+        upload_tasks[task_id].update({
+            "status": "failed",
+            "last_error": str(e)
+        })
+        raise HTTPException(status_code=500, detail=f"文件上传准备失败: {str(e)}")
+    #接下来处理PO单的核心逻辑
+    output_dir = 'output'
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+        
+    # 初始化提取器
+    extractor = TableExtractor()
+    
+    # 处理PDF文件
+    pdf_path = file_path
+    output_path = os.path.join(output_dir, 'table_data.md')
+    
+    try:
+        # 处理文档
+        formatted_table = extractor.process_document(pdf_path, output_path)
+       
+        print(f"\nMarkdown格式的表格数据已保存到: {output_path}")
+        print("\nMarkdown格式的表格内容预览:")
+        print(formatted_table)
+    except FileNotFoundError as e:
+        print(f"错误: {str(e)}")
+        print("请确保PDF文件存在于正确的路径中。")
+    except Exception as e:
+        print(f"处理过程中出现错误: {str(e)}")
+
+@app.post("/api/upload/zip")
+async def upload_zip(background_tasks: BackgroundTasks, file: UploadFile = File(...), task_id = Form(...)):
+    allowed_extensions = {'.zip', '.rar', '.7z', '.tar', '.gz'}
+    file_ext = os.path.splitext(file.filename)[1].lower()
+    
+    if file_ext not in allowed_extensions:
+        raise HTTPException(status_code=400, detail="不支持的文件格式")
+    
+    if not task_id or task_id not in upload_tasks:
+        raise HTTPException(status_code=400, detail="无效的任务ID")
+    
+    try:
+        # 先读取整个文件内容到内存
+        file_content = await file.read()
+        file_size = len(file_content)
+        logger.info(f"成功读取文件内容，大小: {file_size} bytes")
+        
+        file_path = UPLOAD_DIR / f"{task_id}{file_ext}"
+        upload_tasks[task_id].update({
+            "file_path": str(file_path),
+            "status": "uploading",
+            "total_size": file_size,
+            "uploaded_size": 0
+        })
+        
+        # 将文件内容传递给后台任务
+        background_tasks.add_task(process_file_upload, file_content, task_id, file_path)
+        return {"success": True, "message": "文件上传已开始处理"}
+    except Exception as e:
+        logger.error(f"准备上传文件失败: {str(e)}")
+        upload_tasks[task_id].update({
+            "status": "failed",
+            "last_error": str(e)
+        })
+        raise HTTPException(status_code=500, detail=f"文件上传准备失败: {str(e)}")
+
+
 
 @app.post("/api/upload/create_task")
 async def create_task():
@@ -139,29 +233,38 @@ async def create_task():
     logger.info(f"创建新任务: {task_id}")
     return {"success": True, "task_id": task_id}
 
-@app.post("/api/upload/pdf")
-async def upload_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...), task_id: str = Form(...)):
+
     logger.info(f"收到上传请求，task_id: {task_id}, 文件大小: {file.size} bytes")
     
     if not file.filename.endswith('.pdf'):
         raise HTTPException(status_code=400, detail="只支持PDF文件")
-    
     if not task_id or task_id not in upload_tasks:
         raise HTTPException(status_code=400, detail="无效的任务ID")
     
-    file_path = UPLOAD_DIR / f"{task_id}.pdf"
-    upload_tasks[task_id].update({
-        "file_path": str(file_path),
-        "status": "uploading",
-        "total_size": file.size,
-        "uploaded_size": 0
-    })
-    
-    # 将文件处理放到后台任务中
-    background_tasks.add_task(process_file_upload, file, task_id, file_path)
-    
-    # 立即返回成功响应
-    return {"success": True, "message": "文件上传已开始处理"}
+    try:
+        # 先读取整个文件内容到内存
+        file_content = await file.read()
+        file_size = len(file_content)
+        logger.info(f"成功读取文件内容，大小: {file_size} bytes")
+        
+        file_path = UPLOAD_DIR / f"{task_id}.pdf"
+        upload_tasks[task_id].update({
+            "file_path": str(file_path),
+            "status": "uploading",
+            "total_size": file_size,
+            "uploaded_size": 0
+        })
+        
+        # 将文件内容传递给后台任务
+        background_tasks.add_task(process_file_upload, file_content, task_id, file_path)
+        return {"success": True, "message": "文件上传已开始处理"}
+    except Exception as e:
+        logger.error(f"准备上传文件失败: {str(e)}")
+        upload_tasks[task_id].update({
+            "status": "failed",
+            "last_error": str(e)
+        })
+        raise HTTPException(status_code=500, detail=f"文件上传准备失败: {str(e)}")
 
 @app.post("/api/upload/zip")
 async def upload_zip(background_tasks: BackgroundTasks, file: UploadFile = File(...), task_id = Form(...)):
@@ -276,9 +379,6 @@ async def cancel_upload(task_id: str):
     
     return {"success": True}
 
-@app.on_event("startup")
-async def start_cleanup_task():
-    asyncio.create_task(cleanup_expired_tasks())
 
 async def cleanup_expired_tasks():
     logger.info("启动过期任务清理服务")
@@ -324,8 +424,7 @@ async def cleanup_expired_tasks():
             logger.error(f"清理任务出错: {e}")
             await asyncio.sleep(60)
 
-@app.api_route("/debug", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD", "PATCH"])
-async def debug_route(request: Request):
+
     """调试路由，返回请求的详细信息"""
     logger.info("调试路由被访问")
     
